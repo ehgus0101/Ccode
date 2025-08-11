@@ -15,82 +15,82 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Probe multiple endpoints (pick first valid JSON)
+      - name: Probe endpoints (HTTPS first, then HTTP)
         env:
-          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}   # 리포 Settings→Secrets에 등록되어 있어야 함
+          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
         run: |
           python - <<'PY'
           import os, json, requests, pathlib
 
           svc = (os.environ.get("SERVICE_KEY") or "").strip()
           if not svc:
-              raise SystemExit("SERVICE_KEY secret not set")
+            raise SystemExit("SERVICE_KEY secret not set")
 
-          # 후보 엔드포인트 (신/구 혼재 대비)
+          # HTTPS → HTTP 순서로 다양한 조합을 모두 시도
           CANDIDATES = [
-              "https://apis.data.go.kr/B551011/KorService1/areaBasedList1",
-              "https://apis.data.go.kr/B551011/KorService/areaBasedList1",
-              "https://apis.data.go.kr/B551011/KorService1/areaBasedList",
-              "https://apis.data.go.kr/B551011/KorService/areaBasedList",
+            # HTTPS
+            "https://apis.data.go.kr/B551011/KorService1/areaBasedList1",
+            "https://apis.data.go.kr/B551011/KorService/areaBasedList1",
+            "https://apis.data.go.kr/B551011/KorService1/areaBasedList",
+            "https://apis.data.go.kr/B551011/KorService/areaBasedList",
+            # HTTP
+            "http://apis.data.go.kr/B551011/KorService1/areaBasedList1",
+            "http://apis.data.go.kr/B551011/KorService/areaBasedList1",
+            "http://apis.data.go.kr/B551011/KorService1/areaBasedList",
+            "http://apis.data.go.kr/B551011/KorService/areaBasedList",
           ]
 
           base_params = {
-              "MobileOS": "ETC",
-              "MobileApp": "CI-Smoke",
-              "_type": "json",
-              "areaCode": 1,
-              "numOfRows": 5,
-              "pageNo": 1,
-              "listYN": "Y",
-              "arrange": "A",
+            "MobileOS": "ETC",
+            "MobileApp": "CI-Smoke",
+            "_type": "json",
+            "areaCode": 1,
+            "numOfRows": 5,
+            "pageNo": 1,
+            "listYN": "Y",
+            "arrange": "A",
           }
-
-          headers = { "Accept": "application/json,*/*", "User-Agent": "ci-smoke/1.0" }
+          headers = {"Accept": "application/json,*/*", "User-Agent": "ci-smoke/1.0"}
 
           def call(url: str):
-              params = dict(base_params)
-              # 인코딩된 키(% 포함)는 URL에 직접, 일반키는 params로
-              if "%" in svc:
-                  full = f"{url}?serviceKey={svc}"
-              else:
-                  full = url
-                  params["serviceKey"] = svc
-              # ✨ verify=SSLContext 같은 건 넣지 말 것 (TypeError 발생)
-              return requests.get(full, params=params, timeout=20, headers=headers)
+            params = dict(base_params)
+            if "%" in svc:
+              full = f"{url}?serviceKey={svc}"
+            else:
+              full = url
+              params["serviceKey"] = svc
+            # verify 인자 넣지 말기 (bool/경로만 허용됨)
+            return requests.get(full, params=params, timeout=25, headers=headers, allow_redirects=True)
 
           pathlib.Path("out").mkdir(exist_ok=True)
           logs, winner = [], None
 
           for url in CANDIDATES:
-              try:
-                  r = call(url)
-                  logs.append(f"try {url} -> {r.status_code} {r.headers.get('content-type')}")
-                  ctype = (r.headers.get("content-type") or "").lower()
-                  if "json" not in ctype:
-                      open("out/last_non_json.txt","w",encoding="utf-8").write(r.text)
-                      continue
-                  data = r.json()
-                  code = (((data.get("response") or {}).get("header")) or {}).get("resultCode")
-                  if code == "0000":
-                      winner = (url, data)
-                      break
-                  else:
-                      open("out/last_json.json","w",encoding="utf-8").write(
-                          json.dumps(data, ensure_ascii=False, indent=2)
-                      )
-              except Exception as e:
-                  logs.append(f"error {url}: {e!r}")
-                  continue
+            try:
+              r = call(url)
+              logs.append(f"try {url} -> {r.status_code} {r.headers.get('content-type')}")
+              ctype = (r.headers.get("content-type") or "").lower()
+              if "json" not in ctype:
+                open("out/last_non_json.txt","w",encoding="utf-8").write(r.text)
+                continue
+              data = r.json()
+              code = (((data.get("response") or {}).get("header")) or {}).get("resultCode")
+              if code == "0000":
+                winner = (url, data); break
+              else:
+                open("out/last_json.json","w",encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2))
+            except Exception as e:
+              logs.append(f"error {url}: {e!r}")
+              continue
 
           open("out/attempts.log","w").write("\n".join(logs))
 
           if not winner:
-              raise SystemExit("No candidate returned valid JSON with code=0000")
+            raise SystemExit("No candidate returned valid JSON with code=0000")
 
           url, data = winner
           items = (((data.get("response") or {}).get("body") or {}).get("items") or {}).get("item") or []
-          if isinstance(items, dict):
-              items = [items]
+          if isinstance(items, dict): items = [items]
           open("out/pois.json","w",encoding="utf-8").write(json.dumps(items, ensure_ascii=False, indent=2))
           open("out/winner.txt","w").write(url)
           print("[OK] winner:", url, "count:", len(items))
