@@ -1,0 +1,49 @@
+name: API Smoke (data.go.kr)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  call-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install requests
+      - name: Call areaBasedList (save to artifact)
+        env:
+          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
+        run: |
+          python - <<'PY'
+          import os, json, requests, ssl
+          svc = os.environ["SERVICE_KEY"].strip()
+          base = "https://apis.data.go.kr/B551011/KorService/areaBasedList"
+          params = {
+            "MobileOS":"ETC","MobileApp":"CI-Smoke","_type":"json",
+            "areaCode":1,"numOfRows":5,"pageNo":1
+          }
+          url = f"{base}?serviceKey={svc}" if "%" in svc else base
+          if "%" not in svc:
+              params["serviceKey"] = svc
+
+          ctx = ssl.create_default_context()
+          if hasattr(ssl,"TLSVersion"): ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+          r = requests.get(url, params=params, timeout=20, verify=ctx)
+          print("status:", r.status_code, r.headers.get("content-type"))
+          txt = r.text
+          print("head:", txt[:200])
+
+          # 저장
+          import pathlib
+          pathlib.Path("out").mkdir(exist_ok=True)
+          open("out/pois.json","w",encoding="utf-8").write(txt)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pois-json
+          path: out/pois.json
