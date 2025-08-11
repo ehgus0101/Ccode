@@ -1,4 +1,4 @@
-name: API Smoke (data.go.kr)
+name: API Smoke (TourAPI)
 on: { workflow_dispatch: {} }
 
 jobs:
@@ -7,15 +7,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Probe endpoints (HTTPS first, then HTTP)
+      - name: Probe multiple hosts/paths (old+new, http+https)
         env:
           SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
         run: |
@@ -24,20 +23,20 @@ jobs:
 
           svc = (os.environ.get("SERVICE_KEY") or "").strip()
           if not svc:
-            raise SystemExit("SERVICE_KEY secret not set")
+              raise SystemExit("SERVICE_KEY secret not set")
 
-          # HTTPS → HTTP 순서로 다양한 조합을 모두 시도
-          CANDIDATES = [
-            # HTTPS
-            "https://apis.data.go.kr/B551011/KorService1/areaBasedList1",
-            "https://apis.data.go.kr/B551011/KorService/areaBasedList1",
-            "https://apis.data.go.kr/B551011/KorService1/areaBasedList",
-            "https://apis.data.go.kr/B551011/KorService/areaBasedList",
-            # HTTP
-            "http://apis.data.go.kr/B551011/KorService1/areaBasedList1",
-            "http://apis.data.go.kr/B551011/KorService/areaBasedList1",
-            "http://apis.data.go.kr/B551011/KorService1/areaBasedList",
-            "http://apis.data.go.kr/B551011/KorService/areaBasedList",
+          # 후보 호스트/경로(신형 데이터포털 + 구형 방문코리아)
+          HOSTS = [
+            "https://apis.data.go.kr",             # 신형
+            "http://apis.data.go.kr",
+            "https://api.visitkorea.or.kr",        # 구형
+            "http://api.visitkorea.or.kr",
+          ]
+          PATHS = [
+            "/B551011/KorService1/areaBasedList1",          # 신형 권장
+            "/B551011/KorService/areaBasedList1",           # 신형 변형
+            "/openapi/service/rest/KorService1/areaBasedList1",  # 구형 권장
+            "/openapi/service/rest/KorService/areaBasedList1",   # 구형 변형
           ]
 
           base_params = {
@@ -52,39 +51,54 @@ jobs:
           }
           headers = {"Accept": "application/json,*/*", "User-Agent": "ci-smoke/1.0"}
 
-          def call(url: str):
+          def try_call(url):
+            # 1) 소문자 serviceKey 로 시도
             params = dict(base_params)
+            url1 = url
             if "%" in svc:
-              full = f"{url}?serviceKey={svc}"
+              url1 = f"{url1}?serviceKey={svc}"
             else:
-              full = url
               params["serviceKey"] = svc
-            # verify 인자 넣지 말기 (bool/경로만 허용됨)
-            return requests.get(full, params=params, timeout=25, headers=headers, allow_redirects=True)
+            r = requests.get(url1, params=params, timeout=25, headers=headers, allow_redirects=True)
+            if "json" in (r.headers.get("content-type") or "").lower():
+              return r
+
+            # 2) 대문자 ServiceKey 로 재시도(구형 엔드포인트 호환)
+            params = dict(base_params)
+            url2 = url
+            if "%" in svc:
+              url2 = f"{url2}?ServiceKey={svc}"
+            else:
+              params["ServiceKey"] = svc
+            r2 = requests.get(url2, params=params, timeout=25, headers=headers, allow_redirects=True)
+            return r2
 
           pathlib.Path("out").mkdir(exist_ok=True)
           logs, winner = [], None
-
-          for url in CANDIDATES:
-            try:
-              r = call(url)
-              logs.append(f"try {url} -> {r.status_code} {r.headers.get('content-type')}")
-              ctype = (r.headers.get("content-type") or "").lower()
-              if "json" not in ctype:
-                open("out/last_non_json.txt","w",encoding="utf-8").write(r.text)
+          for host in HOSTS:
+            for path in PATHS:
+              url = host + path
+              try:
+                r = try_call(url)
+                logs.append(f"try {url} -> {r.status_code} {r.headers.get('content-type')}")
+                ctype = (r.headers.get("content-type") or "").lower()
+                if "json" not in ctype:
+                  open("out/last_non_json.txt","w",encoding="utf-8").write(r.text)
+                  continue
+                data = r.json()
+                code = (((data.get("response") or {}).get("header")) or {}).get("resultCode")
+                if code == "0000":
+                  winner = (url, data); raise StopIteration
+                else:
+                  open("out/last_json.json","w",encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2))
+              except StopIteration:
+                break
+              except Exception as e:
+                logs.append(f"error {url}: {e!r}")
                 continue
-              data = r.json()
-              code = (((data.get("response") or {}).get("header")) or {}).get("resultCode")
-              if code == "0000":
-                winner = (url, data); break
-              else:
-                open("out/last_json.json","w",encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2))
-            except Exception as e:
-              logs.append(f"error {url}: {e!r}")
-              continue
+            if winner: break
 
           open("out/attempts.log","w").write("\n".join(logs))
-
           if not winner:
             raise SystemExit("No candidate returned valid JSON with code=0000")
 
@@ -97,7 +111,7 @@ jobs:
           PY
 
       - name: Upload artifacts
-        if: always()
+        if: always
         uses: actions/upload-artifact@v4
         with:
           name: api-smoke-output
