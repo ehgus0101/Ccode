@@ -1,138 +1,102 @@
 name: API Smoke (data.go.kr)
-
-on:
-  workflow_dispatch: {}   # Actions 탭에서 수동 실행
+on: { workflow_dispatch: {} }
 
 jobs:
   call-api:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
+        with: { python-version: "3.11" }
+      - run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Call KorService areaBasedList (with HTTPS→HTTP fallback)
+      - name: Probe multiple endpoints (pick first valid JSON)
         env:
-          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}   # ⚠️ 리포지토리 Secrets에 등록해야 함
-          MOBILE_OS: ETC
-          MOBILE_APP: CI-Smoke
-          AREA_CODE: "1"
-          NUM_ROWS: "5"
-          PAGE_NO: "1"
+          SERVICE_KEY: ${{ secrets.SERVICE_KEY }}
         run: |
-          set -e
           python - <<'PY'
-          import os, ssl, json, requests, sys, pathlib
+          import os, json, requests, ssl, pathlib
 
           svc = (os.environ.get("SERVICE_KEY") or "").strip()
           if not svc:
-              print("[ERROR] SERVICE_KEY secret not set.")
-              sys.exit(1)
+              raise SystemExit("SERVICE_KEY secret not set")
 
-          def try_call(base_url: str):
-              params = {
-                  "MobileOS": os.environ.get("MOBILE_OS","ETC"),
-                  "MobileApp": os.environ.get("MOBILE_APP","CI-Smoke"),
-                  "_type": "json",
-                  "areaCode": os.environ.get("AREA_CODE","1"),
-                  "numOfRows": os.environ.get("NUM_ROWS","5"),
-                  "pageNo": os.environ.get("PAGE_NO","1"),
-              }
-              # 인코딩된 키(% 포함)는 URL에 직접, 일반 키는 params로
+          # 후보 엔드포인트(문서/실서비스 혼용 대비)
+          CANDIDATES = [
+              "https://apis.data.go.kr/B551011/KorService1/areaBasedList1",
+              "https://apis.data.go.kr/B551011/KorService/areaBasedList1",
+              "https://apis.data.go.kr/B551011/KorService1/areaBasedList",
+              "https://apis.data.go.kr/B551011/KorService/areaBasedList",
+          ]
+
+          params_base = {
+              "MobileOS": "ETC",
+              "MobileApp": "CI-Smoke",
+              "_type": "json",
+              "areaCode": 1,
+              "numOfRows": 5,
+              "pageNo": 1,
+          }
+
+          hdrs = {
+              "Accept": "application/json,*/*",
+              "User-Agent": "ci-smoke/1.0",
+          }
+
+          def call(url):
+              params = dict(params_base)
+              # 인코딩된 키(% 포함)는 URL에 직접, 아니면 params에
               if "%" in svc:
-                  url = f"{base_url}/areaBasedList?serviceKey={svc}"
+                  full = f"{url}?serviceKey={svc}"
               else:
-                  url = f"{base_url}/areaBasedList"
+                  full = url
                   params["serviceKey"] = svc
 
-              # TLS 1.2 이상 강제(https일 때만)
-              verify_ctx = True
-              if base_url.startswith("https"):
-                  try:
-                      verify_ctx = ssl.create_default_context()
-                      if hasattr(ssl, "TLSVersion"):
-                          verify_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-                  except Exception:
-                      verify_ctx = True
-
-              r = requests.get(url, params=params, timeout=20, verify=verify_ctx)
+              ctx = ssl.create_default_context()
+              if hasattr(ssl, "TLSVersion"): ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+              r = requests.get(full, params=params, timeout=20, verify=ctx, headers=hdrs)
               return r
 
           pathlib.Path("out").mkdir(exist_ok=True)
-
-          # 1) HTTPS 시도
-          try:
-              r = try_call("https://apis.data.go.kr/B551011/KorService")
-              ok_https = True
-          except Exception as e:
-              ok_https = False
-              https_err = repr(e)
-
-          # 2) 실패 시 HTTP 폴백
-          if not ok_https:
-              print("[INFO] HTTPS failed, trying HTTP fallback…")
+          winner = None
+          logs = []
+          for url in CANDIDATES:
               try:
-                  r = try_call("http://apis.data.go.kr/B551011/KorService")
-                  used_http = True
-              except Exception as e2:
-                  open("out/error.txt","w").write(
-                      "HTTPS error:\n"+https_err+"\n\nHTTP error:\n"+repr(e2)
-                  )
-                  print("[ERROR] Both HTTPS and HTTP failed. See artifact error.txt")
-                  sys.exit(1)
-          else:
-              used_http = False
+                  r = call(url)
+                  logs.append(f"try {url} -> {r.status_code} {r.headers.get('content-type')}")
+                  ctype = (r.headers.get("content-type") or "").lower()
+                  if "json" not in ctype:
+                      # SOAP Fault/HTML 등
+                      open("out/last_non_json.txt","w",encoding="utf-8").write(r.text)
+                      continue
+                  data = r.json()
+                  code = (((data.get("response") or {}).get("header")) or {}).get("resultCode")
+                  if code == "0000":
+                      winner = (url, data)
+                      break
+                  else:
+                      open("out/last_json.json","w",encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2))
+              except Exception as e:
+                  logs.append(f"error {url}: {e!r}")
+                  continue
 
-          ctype = (r.headers.get("content-type") or "").lower()
-          print("status:", r.status_code, "| content-type:", ctype)
-          head = r.text[:300]
-          print("head:", head.replace("\n"," ")[:300])
+          open("out/attempts.log","w").write("\n".join(logs))
 
-          # JSON이 아니면 그대로 저장하고 실패 처리
-          if "json" not in ctype:
-              open("out/response.txt","w",encoding="utf-8").write(r.text)
-              print("[ERROR] Response is not JSON. Saved as out/response.txt")
-              sys.exit(1)
+          if not winner:
+              raise SystemExit("No candidate returned valid JSON with code=0000")
 
-          data = r.json()
-          header = (data.get("response") or {}).get("header") or {}
-          code = header.get("resultCode")
-          msg  = header.get("resultMsg")
-          print("resultCode:", code, "| resultMsg:", msg)
-
-          # 성공코드 확인
-          if code != "0000":
-              open("out/response.json","w",encoding="utf-8").write(json.dumps(data, ensure_ascii=False, indent=2))
-              print("[ERROR] API returned non-success code. Saved as out/response.json")
-              # 흔한 오류 가이드
-              print(" - SERVICE_KEY_IS_INVALID: 인증키 오탈자/권한 문제")
-              print(" - SERVICE_KEY_IS_NOT_REGISTERED: 활용 신청/승인 안 됨")
-              print(" - ACCESS_DENIED: 도메인/IP 제한 등")
-              sys.exit(1)
-
-          # 아이템 저장
-          body = (data.get("response") or {}).get("body") or {}
-          items = ((body.get("items") or {}).get("item") or [])
+          url, data = winner
+          items = (((data.get("response") or {}).get("body") or {}).get("items") or {}).get("item") or []
           if isinstance(items, dict): items = [items]
           open("out/pois.json","w",encoding="utf-8").write(json.dumps(items, ensure_ascii=False, indent=2))
-
-          # 메타 저장(https/ http 어떤 경로였는지 기록)
-          meta = {"used_http_fallback": used_http, "count": len(items)}
-          open("out/meta.json","w",encoding="utf-8").write(json.dumps(meta, ensure_ascii=False, indent=2))
-          print("[OK] Saved", len(items), "items. used_http_fallback:", used_http)
+          open("out/winner.txt","w").write(url)
+          print("[OK] winner:", url, "count:", len(items))
           PY
 
-      - name: Upload artifacts
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: api-smoke-output
           path: out/
