@@ -46,18 +46,17 @@ jobs:
           }
 
           def call(url):
-              params = dict(params_base)
-              # 인코딩된 키(% 포함)는 URL에 직접, 아니면 params에
-              if "%" in svc:
-                  full = f"{url}?serviceKey={svc}"
-              else:
-                  full = url
-                  params["serviceKey"] = svc
+    params = dict(base_params)
+    if "%" in svc:
+        full = f"{url}?serviceKey={svc}"
+    else:
+        full = url
+        params["serviceKey"] = svc
 
-              ctx = ssl.create_default_context()
-              if hasattr(ssl, "TLSVersion"): ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-              r = requests.get(full, params=params, timeout=20, verify=ctx, headers=hdrs)
-              return r
+    headers = {"Accept": "application/json,*/*", "User-Agent": "ci-smoke/1.0"}
+
+    # ✨ verify 인자 제거 (ctx 사용 금지)
+    return requests.get(full, params=params, timeout=20, headers=headers)
 
           pathlib.Path("out").mkdir(exist_ok=True)
           winner = None
